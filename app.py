@@ -10,7 +10,7 @@ from openpyxl.utils import get_column_letter
 
 TZ = "America/New_York"
 
-# ---------- helpers ----------
+# ---------------- helpers ----------------
 def detect_col(df: pd.DataFrame, key: str):
     key = key.upper()
     for c in df.columns:
@@ -48,7 +48,6 @@ def apply_route_colors(ws, colnames):
 
     for r in range(2, ws.max_row + 1):
         ws.cell(r, rate_idx).number_format = "0.00%"
-
         minutes = ws.cell(r, min_idx).value
         flag = ws.cell(r, flag_idx).value
 
@@ -71,8 +70,14 @@ def apply_route_colors(ws, colnames):
 
 def build_excel_bytes(raw_df: pd.DataFrame) -> bytes:
     """
-    输入原始表（B=Route, J=Status, L=Time）
-    输出：RouteMonitor + Summary + Exceptions + Meta + 3pm check + 6pm check
+    Input: 原始表（B=Route, J=Status, L=Time）
+    Output sheets:
+      - RouteMonitor
+      - Summary
+      - Exceptions
+      - 3pm check (>=3pm ET and <50%)
+      - 6pm check (>=6pm ET and <80%)
+      - Meta
     """
     df = raw_df.copy()
 
@@ -81,6 +86,7 @@ def build_excel_bytes(raw_df: pd.DataFrame) -> bytes:
     status_col = df.columns[9]
     time_col = df.columns[11]
 
+    # 识别字段（可选）
     flee_col = detect_col(df, "FLEE")
     driver_col = detect_col(df, "DRIVER")
 
@@ -88,8 +94,8 @@ def build_excel_bytes(raw_df: pd.DataFrame) -> bytes:
     df["StatusU"] = df[status_col].astype(str).str.upper()
 
     tz = pytz.timezone(TZ)
-    now_et_naive = datetime.datetime.now(tz).replace(tzinfo=None)  # 用于分钟差/效率计算（naive）
-    now_et = datetime.datetime.now(tz)  # 用于 3pm/6pm 判断（aware）
+    now_et = datetime.datetime.now(tz)                # for time checks
+    now_et_naive = now_et.replace(tzinfo=None)        # for time diff calc
 
     rows = []
     for route, g in df.groupby(route_col, dropna=True):
@@ -117,6 +123,7 @@ def build_excel_bytes(raw_df: pd.DataFrame) -> bytes:
             minutes_since_last = (now_et_naive - last_del).total_seconds() / 60
             hours_since_first = (now_et_naive - first_del).total_seconds() / 3600
             per_hour = (delivered_cnt / hours_since_first) if hours_since_first and hours_since_first > 0 else None
+
             status_flag = "HAS_DELIVERED"
             if minutes_since_last > 60:
                 bucket = "RED"
@@ -145,5 +152,168 @@ def build_excel_bytes(raw_df: pd.DataFrame) -> bytes:
 
     route_df = pd.DataFrame(rows)
 
-    # 排序：NO_DELIVERED 最上，然后停滞时间最大在上
-    route_df["_sort"] = rou_]()_
+    # sort: NO_DELIVERED first; then stalled first
+    route_df["_sort"] = route_df["MinutesSinceLast"].fillna(10**9)
+    route_df.sort_values(["StatusFlag", "_sort"], ascending=[True, False], inplace=True)
+    route_df.drop(columns="_sort", inplace=True)
+
+    # Summary
+    sum_df = route_df.copy()
+    sum_df["FleeName"] = sum_df["FleeName"].fillna("UNKNOWN")
+    summary_df = sum_df.groupby("FleeName").agg(
+        Routes=("Route", "nunique"),
+        TotalPkgs=("Total", "sum"),
+        Delivered=("Success(Delivered)", "sum"),
+        Failed=("Failed(*FAIL*)", "sum"),
+        Remaining=("Remaining", "sum"),
+        NoDeliveredRoutes=("StatusFlag", lambda s: int((s == "NO_DELIVERED").sum())),
+        RedRoutes=("AlertBucket", lambda s: int((s == "RED").sum())),
+        YellowRoutes=("AlertBucket", lambda s: int((s == "YELLOW").sum())),
+        AvgDeliveriesPerHour=("DeliveriesPerHour", "mean"),
+    ).reset_index()
+    summary_df["CompletionRate"] = (summary_df["Delivered"] / summary_df["TotalPkgs"]).fillna(0.0)
+    summary_df["AvgDeliveriesPerHour"] = summary_df["AvgDeliveriesPerHour"].round(2)
+
+    # Exceptions（固定规则）
+    exc_df = route_df[
+        (route_df["StatusFlag"] == "NO_DELIVERED") |
+        ((route_df["MinutesSinceLast"].fillna(0) > 120) & (route_df["Remaining"] > 0)) |
+        ((route_df["DeliveriesPerHour"].fillna(999) < 10) & (route_df["Remaining"] > 0))
+    ].copy()
+
+    # time checks
+    after_3pm = now_et.hour >= 15
+    after_6pm = now_et.hour >= 18
+    check_3pm = route_df[route_df["CompletionRate"] < 0.5].copy() if after_3pm else route_df.iloc[0:0].copy()
+    check_6pm = route_df[route_df["CompletionRate"] < 0.8].copy() if after_6pm else route_df.iloc[0:0].copy()
+
+    # Excel output
+    wb = Workbook()
+
+    route_cols = [
+        "Route","DriverName","FleeName","Total","Success(Delivered)","Failed(*FAIL*)","Remaining","CompletionRate",
+        "1stDeliveryTime","HoursSinceFirstDelivery","DeliveriesPerHour",
+        "LatestDeliveredTime","MinutesSinceLast","StatusFlag","AlertBucket"
+    ]
+
+    # RouteMonitor
+    ws1 = wb.active
+    ws1.title = "RouteMonitor"
+    ws1.append(route_cols)
+    for r in route_df[route_cols].itertuples(index=False):
+        ws1.append(list(r))
+    style_header(ws1)
+    apply_route_colors(ws1, route_cols)
+    autosize(ws1)
+
+    # Summary
+    ws2 = wb.create_sheet("Summary")
+    summary_cols = ["FleeName","Routes","TotalPkgs","Delivered","Failed","Remaining","CompletionRate",
+                    "NoDeliveredRoutes","RedRoutes","YellowRoutes","AvgDeliveriesPerHour"]
+    ws2.append(summary_cols)
+    for r in summary_df[summary_cols].itertuples(index=False):
+        ws2.append(list(r))
+    style_header(ws2)
+    cr_idx = summary_cols.index("CompletionRate") + 1
+    for rr in range(2, ws2.max_row + 1):
+        ws2.cell(rr, cr_idx).number_format = "0.00%"
+    autosize(ws2)
+
+    # Exceptions
+    ws3 = wb.create_sheet("Exceptions")
+    ws3.append(route_cols)
+    for r in exc_df[route_cols].itertuples(index=False):
+        ws3.append(list(r))
+    style_header(ws3)
+    apply_route_colors(ws3, route_cols)
+    autosize(ws3)
+
+    # 3pm check
+    ws4 = wb.create_sheet("3pm check")
+    ws4["A1"] = "RunTime (ET)"; ws4["B1"] = now_et.strftime("%Y-%m-%d %H:%M:%S")
+    ws4["A2"] = "Rule"; ws4["B2"] = "At/after 3:00 PM ET: CompletionRate < 50%"
+    ws4["A3"] = "RuleApplied"; ws4["B3"] = "YES" if after_3pm else "NO (before 3 PM ET)"
+    ws4.append([]); ws4.append(route_cols)
+    for r in check_3pm[route_cols].itertuples(index=False):
+        ws4.append(list(r))
+    style_header(ws4)
+    light_orange = PatternFill("solid", fgColor="FCE4D6")
+    for rr in range(6, ws4.max_row + 1):
+        for cc in range(1, ws4.max_column + 1):
+            ws4.cell(rr, cc).fill = light_orange
+    autosize(ws4)
+
+    # 6pm check
+    ws5 = wb.create_sheet("6pm check")
+    ws5["A1"] = "RunTime (ET)"; ws5["B1"] = now_et.strftime("%Y-%m-%d %H:%M:%S")
+    ws5["A2"] = "Rule"; ws5["B2"] = "At/after 6:00 PM ET: CompletionRate < 80%"
+    ws5["A3"] = "RuleApplied"; ws5["B3"] = "YES" if after_6pm else "NO (before 6 PM ET)"
+    ws5.append([]); ws5.append(route_cols)
+    for r in check_6pm[route_cols].itertuples(index=False):
+        ws5.append(list(r))
+    style_header(ws5)
+    deep_orange = PatternFill("solid", fgColor="F4B084")
+    for rr in range(6, ws5.max_row + 1):
+        for cc in range(1, ws5.max_column + 1):
+            ws5.cell(rr, cc).fill = deep_orange
+    autosize(ws5)
+
+    # Meta
+    ws6 = wb.create_sheet("Meta")
+    ws6["A1"] = "Now (ET) used for calculation"
+    ws6["B1"] = now_et.strftime("%Y-%m-%d %H:%M:%S")
+    ws6["A3"] = "Color rules"
+    ws6["A4"] = "Purple: NO_DELIVERED"
+    ws6["A5"] = "Yellow: MinutesSinceLast > 30 and <= 60"
+    ws6["A6"] = "Red: MinutesSinceLast > 60"
+    ws6["A8"] = "Exceptions criteria"
+    ws6["A9"] = "1) NO_DELIVERED OR 2) MinutesSinceLast>120 & Remaining>0 OR 3) DeliveriesPerHour<10 & Remaining>0"
+    ws6["A11"] = "3pm rule"
+    ws6["A12"] = "At/after 3:00 PM ET: CompletionRate < 50%"
+    ws6["A14"] = "6pm rule"
+    ws6["A15"] = "At/after 6:00 PM ET: CompletionRate < 80%"
+    autosize(ws6, cap=70)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="Daily DSP Operation Check", layout="wide")
+st.title("Daily DSP Operation Check — 每天一键生成 Excel")
+
+with st.expander("输入要求（必须）", expanded=True):
+    st.markdown(
+        """
+- 原始 Excel 必须包含：
+  - **B列** = Route
+  - **J列** = 包裹状态（Status）
+  - **L列** = 状态时间（StatusTime）
+- 可选列（有就自动带上）：
+  - 列名包含 **Flee** → 作为 FleeName
+  - 列名包含 **Driver** → 作为 DriverName
+        """
+    )
+
+# ✅ 这就是你要的“网页中上传文件的位置”
+uploaded = st.file_uploader("📤 Upload your .xlsx file here", type=["xlsx"])
+
+if uploaded:
+    try:
+        raw_df = pd.read_excel(uploaded, engine="openpyxl", dtype=str)
+    except Exception:
+        raw_df = pd.read_excel(uploaded, dtype=str)
+
+    output_bytes = build_excel_bytes(raw_df)
+    ts = datetime.datetime.now(pytz.timezone(TZ)).strftime("%Y%m%d_%H%M%S")
+
+    st.success("✅ 已生成报表，点击下载：")
+    st.download_button(
+        label="⬇️ Download Excel Report",
+        data=output_bytes,
+        file_name=f"route_monitor_{ts}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    st.info("请先上传 Excel 文件。")
